@@ -64,9 +64,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• [Telegram Channel](https://t.me/sumo_mobile)\n"
         "• [Facebook Page](https://fb.com/sumomobile_mm)\n\n"
         "📍 **ဆိုင်လိပ်စာ**\n"
-        "[🚩ရုံးကြီးလမ်း၊ ရုံးကြီးရပ်၊ မုံရွာမြို့။
-(နာရီစဉ် နှင့်ရွှေစည်းခုံဘုရားတောင်ဘက်လမ်း)
-]\n\n"
+        "[🚩ရုံးကြီးလမ်း၊ ရုံးကြီးရပ်၊ မုံရွာမြို့]\n\n"
         "📞 **Phone :**\n"
         "[09780780440/ 09780780330]\n\n"
         "💬 မေးစရာရှိရင် ဒီမှာပဲ ရေးခဲ့ပါ။"
