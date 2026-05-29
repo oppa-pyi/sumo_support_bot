@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-import json
+import csv
+from datetime import datetime
 
 import uvicorn
 from starlette.applications import Starlette
@@ -25,7 +26,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -41,209 +41,242 @@ if not SUPPORT_GROUP_ID_STR:
     raise ValueError("SUPPORT_GROUP_ID environment variable is required")
 
 SUPPORT_GROUP_ID = int(SUPPORT_GROUP_ID_STR)
-logger.info(f"Target group ID: {SUPPORT_GROUP_ID}")
-
 USE_WEBHOOK = URL is not None
-logger.info(f"Running in {'webhook' if USE_WEBHOOK else 'polling'} mode")
-
-# Store mapping between customers and their messages
-# In production, use a database. For small scale, this is fine.
-user_message_map = {}
+logger.info(f"Group ID: {SUPPORT_GROUP_ID} - Mode: {'webhook' if USE_WEBHOOK else 'polling'}")
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message when /start is issued."""
-    user = update.effective_user
-    logger.info(f"User {user.username or user.id} started the bot")
+# Helper: Save customer data to CSV
+def save_customer(user_id: int, username: str, first_name: str, last_name: str = ""):
+    filename = "customers.csv"
+    file_exists = os.path.isfile(filename)
     
-    welcome_message = (
+    if file_exists:
+        with open(filename, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("user_id") == str(user_id):
+                    return
+    
+    with open(filename, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["user_id", "username", "first_name", "last_name", "first_seen"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "user_id": user_id,
+            "username": username or "",
+            "first_name": first_name,
+            "last_name": last_name,
+            "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+    logger.info(f"Saved customer: {user_id} (@{username})")
+
+
+# /start command
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_customer(user.id, user.username, user.first_name, user.last_name or "")
+    
+    msg = (
         "🤖 **Sumo Mobile မှ ကြိုဆိုပါတယ်**\n\n"
         "ကျနော်ကတော့ Support Bot ပါ။\n"
         "Admin များမှ ဖြေကြားနေပါတယ်။ **ခနစောင့်ပေးပါ။**\n\n"
-        "📢 **Channel များ Join ရန်**\n"
-        "• [Telegram Channel](https://t.me/sumo_mobile)\n"
-        "• [Facebook Page](https://fb.com/sumomobile_mm)\n\n"
-        "📍 **ဆိုင်လိပ်စာ**\n"
-        "[🚩ရုံးကြီးလမ်း၊ ရုံးကြီးရပ်၊ မုံရွာမြို့]\n\n"
-        "📞 **Phone :**\n"
-        "[09780780440/ 09780780330]\n\n"
+        "📍 **SUMO Mobile Monywa**\n"
+        "📞 **ဆက်သွယ်ရန်**\n"
+        "📱 09 780 780 440 (Phone / Viber)\n\n"
         "💬 မေးစရာရှိရင် ဒီမှာပဲ ရေးခဲ့ပါ။"
     )
-    
-    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
-async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Forward user messages to the admin support group."""
+# Forward customer message to admin group
+async def forward_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    message = update.message
+    
+    if not message or not message.text or message.text.startswith('/'):
+        return
+    
+    # Save customer info
+    save_customer(user.id, user.username, user.first_name, user.last_name or "")
+    
+    # Prepare admin message with ALL customer info
+    admin_text = (
+        f"📨 **New message from customer**\n\n"
+        f"👤 **Name:** {user.full_name}\n"
+        f"🆔 **User ID:** `{user.id}`\n"
+        f"📛 **Username:** @{user.username if user.username else 'None'}\n"
+        f"💬 **Message:**\n{message.text}\n\n"
+        f"👇 **Click the button below to reply**"
+    )
+    
+    # Create reply button
+    keyboard = [[InlineKeyboardButton("✏️ Reply to this customer", callback_data=f"reply_{user.id}")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        await context.bot.send_message(
+            chat_id=SUPPORT_GROUP_ID,
+            text=admin_text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=reply_markup
+        )
+        await update.message.reply_text("✅ သင့်မေးခွန်းကို Admin များထံ ပေးပို့လိုက်ပါပြီ။\nအဖြေရရှိရန် ခနစောင့်ပေးပါ။")
+        logger.info(f"Forwarded from {user.id} to group")
+    except Exception as e:
+        logger.error(f"Forward error: {e}")
+        await update.message.reply_text("❌ Failed to send message. Please try again later.")
+
+
+# Handle reply button click
+async def on_reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # Extract customer ID from callback_data ("reply_123456789")
+    customer_id = int(query.data.split('_')[1])
+    
+    # Store in user_data for this admin
+    context.user_data['reply_to'] = customer_id
+    
+    # Try to get customer info from CSV
+    customer_name = "Customer"
+    customer_username = ""
+    if os.path.isfile("customers.csv"):
+        with open("customers.csv", "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("user_id") == str(customer_id):
+                    customer_name = row.get("first_name", "Customer")
+                    customer_username = row.get("username", "")
+                    break
+    
+    await query.edit_message_text(
+        f"✏️ **Replying to:** {customer_name}\n"
+        f"🆔 ID: `{customer_id}`\n"
+        f"📛 @{customer_username if customer_username else 'No username'}\n\n"
+        "**Type your response below.**\n"
+        "The customer will receive it immediately.\n\n"
+        "Type /cancel to cancel reply.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+# Handle admin's reply message in group
+async def on_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     
     if not message or not message.text:
         return
     
-    if message.text.startswith('/'):
-        return
-    
-    logger.info(f"Message from {user.username or user.id}: {message.text[:50]}...")
-    
-    # Store mapping for this user
-    if user.id not in user_message_map:
-        user_message_map[user.id] = []
-    user_message_map[user.id].append({
-        "text": message.text,
-        "message_id": message.message_id
-    })
-    
-    # Create a unique callback data to identify this conversation
-    callback_data = f"reply_{user.id}_{message.message_id}"
-    
-    # Create keyboard with reply button
-    keyboard = [
-        [InlineKeyboardButton("✏️ Reply to this customer", callback_data=callback_data)]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    admin_message = (
-        f"📨 **New message from customer**\n\n"
-        f"👤 **Name:** {user.full_name}\n"
-        f"🆔 **User ID:** `{user.id}`\n"
-        f"👤 **Username:** @{user.username if user.username else 'N/A'}\n"
-        f"💬 **Message:**\n{message.text}\n\n"
-        f"👇 **Click the button below to reply**"
-    )
-    
-    try:
-        await context.bot.send_message(
-            chat_id=SUPPORT_GROUP_ID,
-            text=admin_message,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
-        logger.info(f"Forwarded message from {user.id} to group with reply button")
-        
-        await update.message.reply_text(
-            "✅ သင့်မေးခွန်းကို Admin များထံ ပေးပို့လိုက်ပါပြီ။\n"
-            "အဖြေရရှိရန် ခနစောင့်ပေးပါ။"
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to send to group: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
-
-
-async def handle_reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the reply button click - opens a prompt for admin to type reply."""
-    query = update.callback_query
-    await query.answer()
-    
-    # Extract user_id and message_id from callback_data
-    # Format: reply_{user_id}_{message_id}
-    parts = query.data.split('_')
-    if len(parts) != 3:
-        await query.edit_message_text("Invalid callback data.")
-        return
-    
-    customer_id = int(parts[1])
-    original_msg_id = int(parts[2])
-    
-    # Store in context.user_data temporarily
-    context.user_data['reply_to_customer'] = customer_id
-    context.user_data['reply_to_msg_id'] = original_msg_id
-    
-    # Ask admin to type their reply
-    await query.edit_message_text(
-        f"✏️ **Replying to customer ID:** `{customer_id}`\n\n"
-        f"Please type your response below. The customer will receive it immediately.\n\n"
-        f"_(Type /cancel to cancel)_",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-
-async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the actual reply message from admin after button click."""
-    message = update.message
-    
     # Check if we're in reply mode
-    if 'reply_to_customer' not in context.user_data:
+    if 'reply_to' not in context.user_data:
         return
     
     # Cancel if admin types /cancel
-    if message.text and message.text.startswith('/cancel'):
-        context.user_data.pop('reply_to_customer', None)
-        context.user_data.pop('reply_to_msg_id', None)
+    if message.text.startswith('/cancel'):
+        context.user_data.pop('reply_to', None)
         await message.reply_text("❌ Reply cancelled.")
         return
     
-    customer_id = context.user_data['reply_to_customer']
-    admin_response = message.text
-    
-    if not admin_response:
-        await message.reply_text("Please type a response.")
-        return
-    
-    logger.info(f"Admin replying to customer {customer_id}")
+    customer_id = context.user_data['reply_to']
+    reply_text = message.text
     
     try:
-        # Send the reply to customer
         await context.bot.send_message(
             chat_id=customer_id,
-            text=f"📨 **Admin Response:**\n{admin_response}",
+            text=f"📨 **Admin Response:**\n{reply_text}",
             parse_mode=ParseMode.MARKDOWN
         )
+        await message.reply_text(f"✅ Reply sent to customer `{customer_id}`")
+        logger.info(f"Reply sent to {customer_id}")
         
-        # Notify in group that response was sent
-        await message.reply_text(f"✅ Response sent to customer `{customer_id}`")
-        logger.info(f"Reply sent to customer {customer_id}")
-        
-        # Clear the reply mode
-        context.user_data.pop('reply_to_customer', None)
-        context.user_data.pop('reply_to_msg_id', None)
+        # Clear reply mode
+        context.user_data.pop('reply_to', None)
         
     except Exception as e:
-        logger.error(f"Failed to send reply to customer {customer_id}: {e}")
-        await message.reply_text(
-            f"❌ Failed to send response. Customer may have blocked the bot.\n"
-            f"Error: {str(e)[:100]}"
-        )
+        logger.error(f"Reply error: {e}")
+        await message.reply_text(f"❌ Failed to send. Customer may have blocked the bot. Error: {str(e)[:100]}")
 
 
-async def main() -> None:
-    """Set up PTB application and run."""
+# Command for admin to get customer info
+async def customer_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /customerinfo [user_id]\nExample: /customerinfo 123456789")
+        return
+    
+    customer_id = args[0]
+    
+    if not os.path.isfile("customers.csv"):
+        await update.message.reply_text("No customer data found.")
+        return
+    
+    with open("customers.csv", "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("user_id") == customer_id:
+                msg = (
+                    f"👤 **Customer Info**\n\n"
+                    f"🆔 ID: `{row['user_id']}`\n"
+                    f"📛 Username: @{row['username'] if row['username'] else 'None'}\n"
+                    f"👤 Name: {row['first_name']} {row['last_name']}\n"
+                    f"📅 First seen: {row['first_seen']}"
+                )
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+                return
+    
+    await update.message.reply_text(f"Customer ID {customer_id} not found.")
+
+
+# Command to list all customers (admin only)
+async def list_customers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.isfile("customers.csv"):
+        await update.message.reply_text("No customers yet.")
+        return
+    
+    with open("customers.csv", "r", encoding="utf-8") as f:
+        reader = list(csv.DictReader(f))
+    
+    if not reader:
+        await update.message.reply_text("No customers yet.")
+        return
+    
+    # Show last 10 customers
+    recent = reader[-10:]
+    msg = "📋 **Recent Customers:**\n\n"
+    for c in recent:
+        msg += f"🆔 `{c['user_id']}` - @{c['username'] if c['username'] else 'None'} - {c['first_name']}\n"
+    
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def main():
     application = Application.builder().token(TOKEN).updater(None).build()
     
-    # Add handlers
+    # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, 
-        forward_to_admin
-    ))
-    application.add_handler(CallbackQueryHandler(handle_reply_button, pattern="^reply_"))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUP, 
-        handle_admin_reply
-    ))
+    application.add_handler(CommandHandler("customerinfo", customer_info))
+    application.add_handler(CommandHandler("customers", list_customers))
+    application.add_handler(CallbackQueryHandler(on_reply_button, pattern="^reply_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, forward_to_admin))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUP, on_admin_reply))
     
     if USE_WEBHOOK:
-        logger.info(f"Starting webhook mode with URL: {URL}")
+        logger.info(f"Starting webhook mode on {URL}")
+        await application.bot.set_webhook(url=f"{URL}/telegram")
         
-        webhook_url = f"{URL}/telegram"
-        await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set to: {webhook_url}")
-        
-        async def telegram_webhook(request: Request) -> Response:
+        async def webhook(request: Request) -> Response:
             data = await request.json()
             await application.update_queue.put(Update.de_json(data, application.bot))
             return Response()
         
         async def health(_: Request) -> PlainTextResponse:
-            return PlainTextResponse("Bot is running!")
+            return PlainTextResponse("OK")
         
-        starlette_app = Starlette(
-            routes=[
-                Route("/telegram", telegram_webhook, methods=["POST"]),
-                Route("/healthcheck", health, methods=["GET"]),
-            ]
-        )
+        starlette_app = Starlette(routes=[
+            Route("/telegram", webhook, methods=["POST"]),
+            Route("/healthcheck", health, methods=["GET"]),
+        ])
         
         config = uvicorn.Config(app=starlette_app, port=PORT, host="0.0.0.0")
         server = uvicorn.Server(config)
@@ -257,18 +290,11 @@ async def main() -> None:
         async with application:
             await application.start()
             await application.updater.start_polling()
-            logger.info("Bot started in polling mode!")
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                pass
+            await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot failed to start: {e}")
-        raise
+        logger.info("Bot stopped")
